@@ -7,18 +7,43 @@ import argparse
 import time
 import logging
 from sklearn import metrics
-from utils import utilities, data_generator
+import utilities
+import data_generator
 
-import keras
-from keras.models import Model
-from keras.layers import Input, Dense, Dropout, Lambda, Activation
-import keras.backend as K
-from keras.optimizers import Adam
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.autograd import Variable
 
+MAX_ITERATION=5000
 try:
     import cPickle
 except BaseException:
     import _pickle as cPickle
+
+
+def move_data_to_gpu(x, cuda, volatile=False):
+    x = torch.Tensor(x)
+    if cuda:
+        x = x.cuda()
+    x = Variable(x, volatile=volatile)
+    return x
+
+
+def forward_in_batch(model, x, batch_size, cuda):
+    model.eval()
+    batch_num = int(np.ceil(len(x) / float(batch_size)))
+    output_all = []
+
+    for i1 in range(batch_num):
+        batch_x = x[i1 * batch_size: (i1 + 1) * batch_size]
+        batch_x = move_data_to_gpu(batch_x, cuda, volatile=True)
+        output = model(batch_x)
+        output_all.append(output)
+
+    output_all = torch.cat(output_all, dim=0)
+    return output_all
 
 
 def evaluate(model, input, target, stats_dir, probs_dir, iteration):
@@ -35,6 +60,8 @@ def evaluate(model, input, target, stats_dir, probs_dir, iteration):
     Returns:
       None
     """
+    # Check if cuda
+    cuda = next(model.parameters()).is_cuda
 
     utilities.create_folder(stats_dir)
     utilities.create_folder(probs_dir)
@@ -42,9 +69,11 @@ def evaluate(model, input, target, stats_dir, probs_dir, iteration):
     # Predict presence probabilittarget
     callback_time = time.time()
     (clips_num, time_steps, freq_bins) = input.shape
+
     (input, target) = utilities.transform_data(input, target)
-    output = model.predict(input)
-    output = output.astype(np.float32)  # (clips_num, classes_num)
+
+    output = forward_in_batch(model, input, batch_size=500, cuda=cuda)
+    output = output.data.cpu().numpy()  # (clips_num, classes_num)
 
     # Write out presence probabilities
     prob_path = os.path.join(probs_dir, "prob_{}_iters.p".format(iteration))
@@ -64,8 +93,8 @@ def evaluate(model, input, target, stats_dir, probs_dir, iteration):
             mAP, mAUC, time.time() - callback_time))
 
     if False:
-        logging.info("Saveing prob to {}".format(prob_path))
-        logging.info("Saveing stat to {}".format(stat_path))
+        logging.info("Saving prob to {}".format(prob_path))
+        logging.info("Saving stat to {}".format(stat_path))
 
 
 def train(args):
@@ -81,6 +110,11 @@ def train(args):
     model_type = args.model_type
     model = args.model
     batch_size = args.batch_size
+    cuda = False
+
+    # Move model to gpu
+    if cuda:
+        model.cuda()
 
     # Path of hdf5 data
     bal_train_hdf5_path = os.path.join(data_dir, "bal_train.h5")
@@ -118,8 +152,10 @@ def train(args):
     logging.info("Training data shape: {}".format(train_x.shape))
 
     # Optimization method
-    optimizer = Adam(lr=learning_rate)
-    model.compile(loss='binary_crossentropy', optimizer=optimizer)
+    optimizer = optim.Adam(model.parameters(),
+                           lr=1e-3,
+                           betas=(0.9, 0.999),
+                           eps=1e-07)
 
     # Output directories
     sub_dir = os.path.join(filename,
@@ -153,14 +189,13 @@ def train(args):
         seed=1234)
 
     iteration = 0
-    call_freq = 5000
-    save_freq = 10000
+    call_freq = 1000
     train_time = time.time()
 
     for (batch_x, batch_y) in train_gen.generate():
 
         # Compute stats every several interations
-        if iteration % call_freq == 0:
+        if iteration % call_freq == 0 and iteration > 1:
 
             logging.info("------------------")
 
@@ -188,21 +223,35 @@ def train(args):
 
             train_time = time.time()
 
-        # Update params
         (batch_x, batch_y) = utilities.transform_data(batch_x, batch_y)
-        model.train_on_batch(x=batch_x, y=batch_y)
+
+        batch_x = move_data_to_gpu(batch_x, cuda)
+        batch_y = move_data_to_gpu(batch_y, cuda)
+
+        # Forward.
+        model.train()
+        output = model(batch_x)
+
+        # Loss.
+        loss = F.binary_cross_entropy(output, batch_y)
+
+        # Backward.
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         iteration += 1
-        
-        # Save model
-        if iteration % save_freq == 0:
+
+        # Save model.
+        if iteration % 5000 == 0:
+            save_out_dict = {'iteration': iteration,
+                             'state_dict': model.state_dict(),
+                             'optimizer': optimizer.state_dict(), }
             save_out_path = os.path.join(
-                models_dir, "md_{}_iters.h5".format(iteration))
-            model.save(save_out_path)
+                models_dir, "md_{}_iters.tar".format(iteration))
+            torch.save(save_out_dict, save_out_path)
+            logging.info("Save model to {}".format(save_out_path))
 
         # Stop training when maximum iteration achieves
-        if iteration == 50001:
-            save_out_path = os.path.join(
-                models_dir, "final_weights.h5")
-            model.save_weights(save_out_path)
+        if iteration == MAX_ITERATION:
             break
